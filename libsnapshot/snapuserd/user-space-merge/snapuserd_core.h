@@ -27,6 +27,7 @@
 #include <iostream>
 #include <mutex>
 #include <ostream>
+#include <set>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -122,6 +123,11 @@ class SnapshotHandler : public std::enable_shared_from_this<SnapshotHandler> {
     std::shared_ptr<SnapshotHandler> GetSharedPtr() { return shared_from_this(); }
 
     std::vector<std::pair<sector_t, const CowOperation*>>& GetChunkVec() { return chunk_vec_; }
+    bool IsBlockOverridden(chunk_t block);
+    bool IsCowOpOverridden(const CowOperation* cow_op);
+    bool PersistOverriddenBlocks(sector_t sector, uint64_t len);
+    bool PersistOverriddenBlockList(const std::vector<chunk_t>& blocks);
+    void ClearPersistedOverriddenBlocks();
 
     static bool compare(std::pair<sector_t, const CowOperation*> p1,
                         std::pair<sector_t, const CowOperation*> p2) {
@@ -198,6 +204,11 @@ class SnapshotHandler : public std::enable_shared_from_this<SnapshotHandler> {
 
   private:
     bool ReadMetadata();
+    bool LoadPersistedOverriddenBlocks();
+    bool SavePersistedOverriddenBlocksLocked();
+    uint64_t GetOverrideBitmapBlockCount() const;
+    size_t GetOverrideBitmapRegionSize() const;
+    uint64_t GetOverrideBitmapRegionOffset() const;
     sector_t ChunkToSector(chunk_t chunk) { return chunk << CHUNK_SHIFT; }
     chunk_t SectorToChunk(sector_t sector) { return sector >> CHUNK_SHIFT; }
     bool IsBlockAligned(uint64_t read_size) { return ((read_size & (BLOCK_SZ - 1)) == 0); }
@@ -243,6 +254,9 @@ class SnapshotHandler : public std::enable_shared_from_this<SnapshotHandler> {
 
     // user-space-merging
     std::unordered_map<uint64_t, int> block_to_ra_index_;
+    uint64_t override_bitmap_block_count_ = 0;
+    std::set<chunk_t> overridden_blocks_;
+    std::mutex overridden_blocks_lock_;
 
     // Merge Block state
     std::vector<std::unique_ptr<MergeGroupState>> merge_blk_state_;

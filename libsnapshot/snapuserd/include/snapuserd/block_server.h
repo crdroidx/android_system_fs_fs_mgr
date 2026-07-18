@@ -41,6 +41,12 @@ class IBlockServer {
         // If false is returned, an error will be automatically reported unless
         // SendError was called.
         virtual bool RequestSectors(uint64_t sector, uint64_t size) = 0;
+
+        // Handle write requests for a contiguous run of sectors.
+        //
+        // |data| contains exactly |size| bytes to be written starting at
+        // |sector|.
+        virtual bool CommitSectors(uint64_t sector, const void* data, uint64_t size) = 0;
     };
 
     virtual ~IBlockServer() {}

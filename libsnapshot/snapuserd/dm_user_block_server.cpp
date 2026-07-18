@@ -26,7 +26,10 @@ using android::base::unique_fd;
 
 DmUserBlockServer::DmUserBlockServer(const std::string& misc_name, unique_fd&& ctrl_fd,
                                      Delegate* delegate, size_t buffer_size)
-    : misc_name_(misc_name), ctrl_fd_(std::move(ctrl_fd)), delegate_(delegate) {
+    : misc_name_(misc_name),
+      ctrl_fd_(std::move(ctrl_fd)),
+      delegate_(delegate),
+      payload_buffer_size_(buffer_size) {
     buffer_.Initialize(sizeof(struct dm_user_header), buffer_size);
 }
 
@@ -71,10 +74,38 @@ bool DmUserBlockServer::ProcessRequest(dm_user_header* header) {
             return delegate_->RequestSectors(header->sector, header->len);
 
         case DM_USER_REQ_MAP_WRITE:
-            // We should not get any write request to dm-user as we mount all
-            // partitions as read-only.
-            SNAP_LOG(ERROR) << "Unexpected write request from dm-user";
-            return false;
+            if (header->len > 0) {
+                if (header->len % SECTOR_SIZE != 0) {
+                    SNAP_LOG(ERROR) << "Write request has unaligned length: " << header->len;
+                    return false;
+                }
+
+                uint64_t remaining = header->len;
+                uint64_t sector = header->sector;
+                while (remaining > 0) {
+                    const size_t chunk = std::min<uint64_t>(remaining, payload_buffer_size_);
+                    void* payload = buffer_.GetPayloadBuffer(chunk);
+                    if (!payload) {
+                        SNAP_LOG(ERROR) << "Failed to allocate write payload chunk: " << chunk;
+                        return false;
+                    }
+
+                    if (!android::base::ReadFully(ctrl_fd_, payload, chunk)) {
+                        SNAP_PLOG(ERROR) << "Control-read for write payload failed";
+                        return false;
+                    }
+
+                    if (!delegate_->CommitSectors(sector, payload, chunk)) {
+                        return false;
+                    }
+
+                    remaining -= chunk;
+                    sector += chunk >> SECTOR_SHIFT;
+                }
+            }
+
+            // A successful write request only needs a response header.
+            return WriteDmUserPayload(0);
 
         default:
             SNAP_LOG(ERROR) << "Unexpected request from dm-user: " << request_type;

@@ -34,6 +34,7 @@ class ReadWorker : public Worker, public IBlockServer::Delegate {
     bool Init() override;
     void CloseFds() override;
     bool RequestSectors(uint64_t sector, uint64_t size) override;
+    bool CommitSectors(uint64_t sector, const void* data, uint64_t size) override;
 
     IBlockServer* block_server() const { return block_server_.get(); }
 

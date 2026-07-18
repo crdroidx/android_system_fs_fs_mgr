@@ -42,6 +42,7 @@ class DmUserBlockServer : public IBlockServer {
     std::string misc_name_;
     android::base::unique_fd ctrl_fd_;
     Delegate* delegate_;
+    size_t payload_buffer_size_;
 
     // Per-request state.
     BufferSink buffer_;

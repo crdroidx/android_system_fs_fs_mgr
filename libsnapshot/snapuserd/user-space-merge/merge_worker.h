@@ -33,6 +33,7 @@ class MergeWorker : public Worker {
     bool MergeReplaceZeroOps();
     bool MergeOrderedOps();
     bool MergeOrderedOpsAsync();
+    bool PreserveOverriddenBlocks(const CowOperation* cow_op, void* op_buffer, size_t op_size);
     bool Merge();
     bool AsyncMerge();
     bool SyncMerge();

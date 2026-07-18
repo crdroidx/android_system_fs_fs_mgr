@@ -47,6 +47,321 @@ SnapshotHandler::SnapshotHandler(std::string misc_name, std::string cow_device,
     handler_options_ = options;
 }
 
+namespace {
+constexpr uint32_t kOverrideBitmapMagic = 0x534F5652;  // 'SOVR'
+constexpr uint16_t kOverrideBitmapVersion = 1;
+constexpr size_t kDefaultOverrideRegionSize = 64 * 1024;
+
+size_t AlignToBlock(size_t size) {
+    return ((size + BLOCK_SZ - 1) / BLOCK_SZ) * BLOCK_SZ;
+}
+}  // namespace
+
+struct OverrideBitmapRegionHeader {
+    uint32_t magic;
+    uint16_t version;
+    uint16_t header_size;
+    uint64_t total_ops;
+    uint32_t bitmap_bytes;
+    uint32_t reserved;
+} __attribute__((packed));
+
+uint64_t SnapshotHandler::GetOverrideBitmapBlockCount() const {
+    if (!override_bitmap_block_count_) {
+        return reader_ ? reader_->get_num_total_data_ops() : 0;
+    }
+    return override_bitmap_block_count_;
+}
+
+size_t SnapshotHandler::GetOverrideBitmapRegionSize() const {
+    if (!scratch_space_ || !reader_) {
+        return 0;
+    }
+
+    const auto& header = reader_->GetHeader();
+    size_t buffer_size = header.buffer_size;
+    if (buffer_size <= (4 * BLOCK_SZ)) {
+        return 0;
+    }
+
+    const uint64_t total_blocks = GetOverrideBitmapBlockCount();
+    const size_t required_bitmap_bytes = (total_blocks + 7) / 8;
+    const size_t required_region =
+            AlignToBlock(sizeof(OverrideBitmapRegionHeader) + required_bitmap_bytes);
+
+    const size_t min_region = AlignToBlock(kDefaultOverrideRegionSize);
+    // Keep at least 2 blocks for read-ahead scratch metadata/data.
+    const size_t max_region = buffer_size - (2 * BLOCK_SZ);
+
+    size_t region_size = std::max(min_region, required_region);
+    region_size = std::min(region_size, max_region);
+    region_size = AlignToBlock(region_size);
+
+    if (region_size < required_region) {
+        return 0;
+    }
+
+    if (buffer_size <= (region_size + 2 * BLOCK_SZ)) {
+        return 0;
+    }
+    return region_size;
+}
+
+uint64_t SnapshotHandler::GetOverrideBitmapRegionOffset() const {
+    const auto& header = reader_->GetHeader();
+    const size_t region_size = GetOverrideBitmapRegionSize();
+    if (region_size == 0) {
+        return 0;
+    }
+    return header.prefix.header_size + header.buffer_size - region_size;
+}
+
+static bool MsyncAlignedRegion(void* mapped_addr, uint64_t region_offset, size_t region_size) {
+    if (region_size == 0) {
+        return true;
+    }
+
+    const long page_size = sysconf(_SC_PAGESIZE);
+    if (page_size <= 0) {
+        PLOG(ERROR) << "sysconf(_SC_PAGESIZE) failed";
+        return false;
+    }
+
+    const uint64_t page_mask = static_cast<uint64_t>(page_size - 1);
+    const uint64_t aligned_offset = region_offset & ~page_mask;
+    const uint64_t end_offset = region_offset + region_size;
+    const uint64_t aligned_end = (end_offset + page_mask) & ~page_mask;
+    const size_t aligned_size = aligned_end - aligned_offset;
+
+    auto* aligned_ptr = reinterpret_cast<uint8_t*>(mapped_addr) + aligned_offset;
+    if (msync(aligned_ptr, aligned_size, MS_SYNC) < 0) {
+        PLOG(ERROR) << "msync failed for override bitmap aligned region";
+        return false;
+    }
+    return true;
+}
+
+bool SnapshotHandler::SavePersistedOverriddenBlocksLocked() {
+    const size_t region_size = GetOverrideBitmapRegionSize();
+    if (region_size == 0) {
+        SNAP_LOG(ERROR) << "Override bitmap region unavailable in COW";
+        return false;
+    }
+    if (!mapped_addr_) {
+        SNAP_LOG(ERROR) << "Override bitmap region unavailable: mapping is null";
+        return false;
+    }
+
+    const uint64_t region_offset = GetOverrideBitmapRegionOffset();
+    if (region_offset + region_size > total_mapped_addr_length_) {
+        SNAP_LOG(ERROR) << "Override bitmap region out of mapped range. offset=" << region_offset
+                        << " size=" << region_size << " mapped_len=" << total_mapped_addr_length_;
+        return false;
+    }
+
+    const uint64_t total_blocks = GetOverrideBitmapBlockCount();
+    const size_t region_capacity = region_size - sizeof(OverrideBitmapRegionHeader);
+    const size_t required_bitmap_bytes = (total_blocks + 7) / 8;
+    if (required_bitmap_bytes > region_capacity) {
+        SNAP_LOG(ERROR) << "Override bitmap capacity too small in COW scratch region. "
+                        << "required=" << required_bitmap_bytes << " capacity=" << region_capacity;
+        return false;
+    }
+
+    std::vector<uint8_t> bitmap(required_bitmap_bytes, 0);
+    for (const auto block : overridden_blocks_) {
+        if (static_cast<uint64_t>(block) >= total_blocks) {
+            continue;
+        }
+        bitmap[block / 8] |= static_cast<uint8_t>(1u << (block % 8));
+    }
+
+    OverrideBitmapRegionHeader header = {
+            .magic = kOverrideBitmapMagic,
+            .version = kOverrideBitmapVersion,
+            .header_size = static_cast<uint16_t>(sizeof(OverrideBitmapRegionHeader)),
+            .total_ops = total_blocks,
+            .bitmap_bytes = static_cast<uint32_t>(required_bitmap_bytes),
+            .reserved = 0,
+    };
+
+    auto* region = reinterpret_cast<uint8_t*>(mapped_addr_) + region_offset;
+    SNAP_LOG(INFO) << "Saving override bitmap: offset=" << region_offset << " size=" << region_size
+                   << " blocks=" << overridden_blocks_.size() << " tracked_blocks=" << total_blocks;
+    memset(region, 0, region_size);
+    memcpy(region, &header, sizeof(header));
+    if (!bitmap.empty()) {
+        memcpy(region + sizeof(header), bitmap.data(), bitmap.size());
+    }
+
+    if (!MsyncAlignedRegion(mapped_addr_, region_offset, region_size)) {
+        SNAP_LOG(ERROR) << "Failed to flush COW override bitmap region";
+        return false;
+    }
+
+    return true;
+}
+
+bool SnapshotHandler::LoadPersistedOverriddenBlocks() {
+    const size_t region_size = GetOverrideBitmapRegionSize();
+    SNAP_LOG(INFO) << "LoadPersistedOverriddenBlocks: scratch_space=" << scratch_space_
+                   << " region_size=" << region_size;
+    if (region_size == 0) {
+        SNAP_LOG(INFO) << "Override bitmap region unavailable; skipping load";
+        return true;
+    }
+    if (!mapped_addr_) {
+        SNAP_LOG(INFO) << "Override bitmap load skipped: mapped_addr_ is null";
+        return true;
+    }
+
+    const uint64_t region_offset = GetOverrideBitmapRegionOffset();
+    if (region_offset + region_size > total_mapped_addr_length_) {
+        SNAP_LOG(WARNING) << "Override bitmap region outside mapped range; ignoring"
+                          << " offset=" << region_offset << " size=" << region_size
+                          << " mapped_len=" << total_mapped_addr_length_;
+        return true;
+    }
+
+    auto* region = reinterpret_cast<uint8_t*>(mapped_addr_) + region_offset;
+    OverrideBitmapRegionHeader header;
+    memcpy(&header, region, sizeof(header));
+
+    if (header.magic != kOverrideBitmapMagic || header.version != kOverrideBitmapVersion ||
+        header.header_size != sizeof(OverrideBitmapRegionHeader)) {
+        SNAP_LOG(WARNING) << "Override bitmap header invalid; magic=" << std::hex << header.magic
+                          << " version=" << std::dec << header.version
+                          << " header_size=" << header.header_size << " expected_magic=" << std::hex
+                          << kOverrideBitmapMagic << " expected_version=" << std::dec
+                          << kOverrideBitmapVersion
+                          << " expected_header_size=" << sizeof(OverrideBitmapRegionHeader);
+        std::lock_guard<std::mutex> lock(overridden_blocks_lock_);
+        overridden_blocks_.clear();
+        return true;
+    }
+
+    const uint64_t expected_total_blocks = GetOverrideBitmapBlockCount();
+    const size_t expected_bitmap_bytes = (expected_total_blocks + 7) / 8;
+    const size_t region_capacity = region_size - sizeof(OverrideBitmapRegionHeader);
+    if (header.total_ops != expected_total_blocks || header.bitmap_bytes != expected_bitmap_bytes ||
+        header.bitmap_bytes > region_capacity) {
+        SNAP_LOG(WARNING) << "COW override bitmap mismatch; ignoring persisted overrides"
+                          << " header.total_ops=" << header.total_ops
+                          << " expected_total_ops=" << expected_total_blocks
+                          << " header.bitmap_bytes=" << header.bitmap_bytes
+                          << " expected_bitmap_bytes=" << expected_bitmap_bytes
+                          << " region_capacity=" << region_capacity;
+        return true;
+    }
+
+    std::vector<uint8_t> bitmap(header.bitmap_bytes, 0);
+    if (!bitmap.empty()) {
+        memcpy(bitmap.data(), region + sizeof(header), bitmap.size());
+    }
+
+    std::lock_guard<std::mutex> lock(overridden_blocks_lock_);
+    overridden_blocks_.clear();
+    for (uint64_t block = 0; block < expected_total_blocks; block++) {
+        const uint8_t byte = bitmap[block / 8];
+        if (byte & static_cast<uint8_t>(1u << (block % 8))) {
+            overridden_blocks_.insert(static_cast<chunk_t>(block));
+        }
+    }
+
+    SNAP_LOG(INFO) << "Loaded " << overridden_blocks_.size() << " persisted overridden blocks"
+                   << " from override bitmap region offset=" << region_offset
+                   << " size=" << region_size;
+    return true;
+}
+
+bool SnapshotHandler::IsBlockOverridden(chunk_t block) {
+    std::lock_guard<std::mutex> lock(overridden_blocks_lock_);
+    return overridden_blocks_.find(block) != overridden_blocks_.end();
+}
+
+bool SnapshotHandler::IsCowOpOverridden(const CowOperation* cow_op) {
+    if (!cow_op) {
+        return false;
+    }
+
+    uint64_t blocks = 1;
+    if (cow_op->type() == kCowReplaceOp) {
+        blocks = CowOpCompressionSize(cow_op, BLOCK_SZ) / BLOCK_SZ;
+    }
+
+    std::lock_guard<std::mutex> lock(overridden_blocks_lock_);
+    for (uint64_t i = 0; i < blocks; i++) {
+        if (overridden_blocks_.find(cow_op->new_block + i) == overridden_blocks_.end()) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool SnapshotHandler::PersistOverriddenBlocks(sector_t sector, uint64_t len) {
+    if ((sector << SECTOR_SHIFT) % BLOCK_SZ != 0 || len % BLOCK_SZ != 0) {
+        SNAP_LOG(ERROR) << "PersistOverriddenBlocks requires block-aligned writes";
+        return false;
+    }
+    if (!scratch_space_) {
+        SNAP_LOG(ERROR) << "PersistOverriddenBlocks requires COW scratch space";
+        return false;
+    }
+
+    const chunk_t start = SectorToChunk(sector);
+    const uint64_t blocks = len / BLOCK_SZ;
+
+    std::vector<chunk_t> override_blocks;
+    override_blocks.reserve(blocks);
+    for (uint64_t i = 0; i < blocks; i++) {
+        override_blocks.push_back(start + i);
+    }
+
+    return PersistOverriddenBlockList(override_blocks);
+}
+
+bool SnapshotHandler::PersistOverriddenBlockList(const std::vector<chunk_t>& blocks) {
+    if (!scratch_space_) {
+        SNAP_LOG(ERROR) << "PersistOverriddenBlockList requires COW scratch space";
+        return false;
+    }
+    if (blocks.empty()) {
+        return true;
+    }
+
+    std::lock_guard<std::mutex> lock(overridden_blocks_lock_);
+    SNAP_LOG(INFO) << "PersistOverriddenBlockList count=" << blocks.size();
+    for (const auto block : blocks) {
+        overridden_blocks_.insert(block);
+    }
+
+    return SavePersistedOverriddenBlocksLocked();
+}
+
+void SnapshotHandler::ClearPersistedOverriddenBlocks() {
+    std::lock_guard<std::mutex> lock(overridden_blocks_lock_);
+    overridden_blocks_.clear();
+    const size_t region_size = GetOverrideBitmapRegionSize();
+    if (region_size == 0) {
+        return;
+    }
+    if (!mapped_addr_) {
+        return;
+    }
+
+    const uint64_t region_offset = GetOverrideBitmapRegionOffset();
+    if (region_offset + region_size > total_mapped_addr_length_) {
+        SNAP_LOG(WARNING) << "Override bitmap clear skipped: region outside mapped range";
+        return;
+    }
+
+    auto* region = reinterpret_cast<uint8_t*>(mapped_addr_) + region_offset;
+    memset(region, 0, region_size);
+    if (!MsyncAlignedRegion(mapped_addr_, region_offset, region_size)) {
+        SNAP_LOG(ERROR) << "Failed to clear COW override bitmap region";
+    }
+}
+
 bool SnapshotHandler::InitializeWorkers() {
     for (int i = 0; i < handler_options_.num_worker_threads; i++) {
         auto wt = std::make_unique<ReadWorker>(cow_device_, backing_store_device_, misc_name_,
@@ -204,6 +519,22 @@ bool SnapshotHandler::ReadMetadata() {
 
     UpdateMergeCompletionPercentage();
 
+    override_bitmap_block_count_ = 0;
+    {
+        std::unique_ptr<ICowOpIter> bitmap_iter = reader_->GetOpIter(true);
+        while (!bitmap_iter->AtEnd()) {
+            const CowOperation* cow_op = bitmap_iter->Get();
+            uint64_t op_blocks = 1;
+            if (cow_op->type() == kCowReplaceOp) {
+                op_blocks =
+                        std::max<uint64_t>(1, CowOpCompressionSize(cow_op, BLOCK_SZ) / BLOCK_SZ);
+            }
+            const uint64_t op_end_block = static_cast<uint64_t>(cow_op->new_block) + op_blocks;
+            override_bitmap_block_count_ = std::max(override_bitmap_block_count_, op_end_block);
+            bitmap_iter->Next();
+        }
+    }
+
     // Initialize the iterator for reading metadata
     std::unique_ptr<ICowOpIter> cowop_iter = reader_->GetOpIter(true);
 
@@ -260,6 +591,10 @@ bool SnapshotHandler::ReadMetadata() {
                    << " Unmerged-ops: " << chunk_vec_.size() << " Copy-ops: " << copy_ops
                    << " Zero-ops: " << zero_ops << " Replace-ops: " << replace_ops
                    << " Xor-ops: " << xor_ops << " Resuming previous merge: " << resume_merge_;
+
+    if (!LoadPersistedOverriddenBlocks()) {
+        return false;
+    }
 
     return true;
 }
@@ -402,6 +737,11 @@ size_t SnapshotHandler::GetBufferMetadataSize() {
         buffer_size = BUFFER_REGION_DEFAULT_SIZE;
     }
 
+    const size_t override_region = GetOverrideBitmapRegionSize();
+    if (buffer_size > override_region) {
+        buffer_size -= override_region;
+    }
+
     return ((buffer_size * sizeof(struct ScratchMetadata)) / BLOCK_SZ);
 }
 
@@ -422,6 +762,11 @@ size_t SnapshotHandler::GetBufferDataSize() {
     // anonymous memory
     if (buffer_size == 0) {
         buffer_size = BUFFER_REGION_DEFAULT_SIZE;
+    }
+
+    const size_t override_region = GetOverrideBitmapRegionSize();
+    if (buffer_size > override_region) {
+        buffer_size -= override_region;
     }
 
     return (buffer_size - GetBufferMetadataSize());

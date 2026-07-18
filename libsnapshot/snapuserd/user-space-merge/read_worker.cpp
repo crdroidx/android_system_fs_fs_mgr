@@ -377,6 +377,9 @@ bool ReadWorker::ReadAlignedSector(sector_t sector, size_t sz) {
                     // Get the nearest operation found in the vector
                     cow_op = it->second;
                     is_mapping_present = GetCowOpBlockOffset(cow_op, io_block, &block_offset);
+                    if (is_mapping_present && snapuserd_->IsCowOpOverridden(cow_op)) {
+                        is_mapping_present = false;
+                    }
                 }
 
                 // Thus, we have a case wherein sector was not found in the sorted
@@ -437,7 +440,12 @@ bool ReadWorker::ReadAlignedSector(sector_t sector, size_t sz) {
             } else {
                 // We found the sector in mapping. Check the type of COW OP and
                 // process it.
-                if (!ProcessCowOp(it->second, buffer)) {
+                if (snapuserd_->IsCowOpOverridden(it->second)) {
+                    if (!ReadDataFromBaseDevice(sector, buffer, size)) {
+                        SNAP_LOG(ERROR) << "ReadDataFromBaseDevice failed for overridden block";
+                        return false;
+                    }
+                } else if (!ProcessCowOp(it->second, buffer)) {
                     SNAP_LOG(ERROR)
                             << "ProcessCowOp failed, sector = " << sector << ", size = " << sz;
                     return false;
@@ -488,6 +496,21 @@ int ReadWorker::ReadUnalignedSector(
     const CowOperation* cow_op = it->second;
     if (IsMappingPresent(cow_op, requested_offset, final_offset)) {
         size_t buffer_size = CowOpCompressionSize(cow_op, BLOCK_SZ);
+        if (snapuserd_->IsCowOpOverridden(cow_op)) {
+            size_t skip_offset = (requested_offset - final_offset);
+            size_t write_sz = std::min(size, buffer_size - skip_offset);
+            auto buffer = reinterpret_cast<uint8_t*>(
+                    block_server_->GetResponseBuffer(BLOCK_SZ, write_sz));
+            if (!buffer) {
+                SNAP_LOG(ERROR) << "ReadUnalignedSector failed to allocate buffer";
+                return -1;
+            }
+            if (!ReadDataFromBaseDevice(sector, buffer, write_sz)) {
+                SNAP_LOG(ERROR) << "ReadDataFromBaseDevice failed for overridden unaligned read";
+                return -1;
+            }
+            return write_sz;
+        }
         uint8_t chunk[buffer_size];
         // Read the entire decompressed buffer based on the block-size
         if (!ProcessReplaceOp(cow_op, chunk, buffer_size)) {
@@ -517,7 +540,12 @@ int ReadWorker::ReadUnalignedSector(
         return -1;
     }
 
-    if (!ProcessCowOp(it->second, buffer)) {
+    if (snapuserd_->IsCowOpOverridden(it->second)) {
+        if (!ReadDataFromBaseDevice(sector, buffer, write_size)) {
+            SNAP_LOG(ERROR) << "ReadDataFromBaseDevice failed for overridden unaligned block";
+            return -1;
+        }
+    } else if (!ProcessCowOp(it->second, buffer)) {
         SNAP_LOG(ERROR) << "ReadUnalignedSector: " << sector << " failed of size: " << size
                         << " Aligned sector: " << it->first;
         return -1;
@@ -675,6 +703,131 @@ bool ReadWorker::RequestSectors(uint64_t sector, uint64_t len) {
     }
 
     return ReadAlignedSector(sector, len);
+}
+
+bool ReadWorker::CommitSectors(uint64_t sector, const void* data, uint64_t len) {
+    if (len == 0) {
+        return true;
+    }
+
+    SNAP_LOG(INFO) << "CommitSectors sector=" << sector << " len=" << len;
+
+    std::set<chunk_t> override_blocks;
+    std::vector<const CowOperation*> mapped_replace_ops;
+    std::set<const CowOperation*> seen_replace_ops;
+
+    auto touches_mapped_sector = [&](uint64_t start_sector, uint64_t io_len) {
+        const auto& chunk_vec = snapuserd_->GetChunkVec();
+        const uint64_t end_sector = start_sector + (io_len >> SECTOR_SHIFT);
+        uint64_t cur_sector = start_sector;
+        bool touched = false;
+        while (cur_sector < end_sector) {
+            bool is_mapped = false;
+            const CowOperation* mapped_op = nullptr;
+            auto it =
+                    std::lower_bound(chunk_vec.begin(), chunk_vec.end(),
+                                     std::make_pair(cur_sector, nullptr), SnapshotHandler::compare);
+            if (it != chunk_vec.end() && it->first == cur_sector) {
+                is_mapped = !snapuserd_->IsCowOpOverridden(it->second);
+                mapped_op = it->second;
+            } else {
+                uint64_t io_block = SectorToChunk(cur_sector);
+                if (it != chunk_vec.begin()) {
+                    std::advance(it, -1);
+                }
+                if (it != chunk_vec.end()) {
+                    const CowOperation* cow_op = it->second;
+                    off_t block_offset = 0;
+                    is_mapped = GetCowOpBlockOffset(cow_op, io_block, &block_offset);
+                    if (is_mapped && snapuserd_->IsCowOpOverridden(cow_op)) {
+                        is_mapped = false;
+                    } else if (is_mapped) {
+                        mapped_op = cow_op;
+                    }
+                }
+            }
+
+            if (is_mapped) {
+                CHECK(mapped_op != nullptr);
+                const chunk_t io_block = SectorToChunk(cur_sector);
+                override_blocks.insert(io_block);
+                if (mapped_op->type() == kCowReplaceOp &&
+                    seen_replace_ops.insert(mapped_op).second) {
+                    mapped_replace_ops.push_back(mapped_op);
+                }
+                touched = true;
+            }
+
+            const uint64_t next_block_sector = ChunkToSector(SectorToChunk(cur_sector) + 1);
+            cur_sector = std::min(next_block_sector, end_sector);
+        }
+        return touched;
+    };
+
+    const bool touched_mapped = touches_mapped_sector(sector, len);
+    if (touched_mapped) {
+        SNAP_LOG(INFO) << "Mapped write detected; persisting override coverage";
+        if (!IsBlockAligned(sector << SECTOR_SHIFT) || !IsBlockAligned(len)) {
+            SNAP_LOG(ERROR) << "Mapped write must be 4K aligned for persisted override metadata";
+            return false;
+        }
+
+        // Expand mapped replace-op writes to full op coverage on base device so reboot
+        // and merge paths can safely honor per-block overrides.
+        for (const auto* cow_op : mapped_replace_ops) {
+            const size_t op_size = CowOpCompressionSize(cow_op, BLOCK_SZ);
+            const uint64_t op_blocks = op_size / BLOCK_SZ;
+            std::vector<uint8_t> op_data(op_size);
+            if (!ProcessReplaceOp(cow_op, op_data.data(), op_size)) {
+                SNAP_LOG(ERROR) << "Failed to materialize replace-op for override, block "
+                                << cow_op->new_block;
+                return false;
+            }
+
+            for (uint64_t i = 0; i < op_blocks; i++) {
+                const chunk_t block = cow_op->new_block + i;
+                if (override_blocks.find(block) != override_blocks.end() ||
+                    snapuserd_->IsBlockOverridden(block)) {
+                    continue;
+                }
+
+                const uint64_t block_sector = ChunkToSector(block);
+                const loff_t block_offset = block_sector << SECTOR_SHIFT;
+                void* block_ptr = op_data.data() + (i * BLOCK_SZ);
+                if (!android::base::WriteFullyAtOffset(base_path_merge_fd_, block_ptr, BLOCK_SZ,
+                                                       block_offset)) {
+                    SNAP_PLOG(ERROR)
+                            << "Failed to materialize replace-op block to base. block=" << block;
+                    return false;
+                }
+                override_blocks.insert(block);
+            }
+        }
+    }
+
+    loff_t offset = sector << SECTOR_SHIFT;
+    if (!android::base::WriteFullyAtOffset(base_path_merge_fd_, data, len, offset)) {
+        SNAP_PLOG(ERROR) << "WriteDataToBaseDevice failed. fd: " << base_path_merge_fd_
+                         << " at sector: " << sector << " size: " << len;
+        return false;
+    }
+
+    // Persist data before ACK.
+    if (fsync(base_path_merge_fd_.get()) < 0) {
+        SNAP_PLOG(ERROR) << "fsync(base_path_merge_fd_) failed after write";
+        return false;
+    }
+
+    if (touched_mapped) {
+        std::vector<chunk_t> block_list(override_blocks.begin(), override_blocks.end());
+        SNAP_LOG(INFO) << "Persisting override block count=" << block_list.size();
+        if (!snapuserd_->PersistOverriddenBlockList(block_list)) {
+            SNAP_LOG(ERROR) << "Failed to persist overridden mapped blocks metadata";
+            return false;
+        }
+    }
+
+    return true;
 }
 
 bool ReadWorker::SendBufferedIo() {

@@ -38,6 +38,33 @@ MergeWorker::MergeWorker(const std::string& cow_device, const std::string& misc_
     : Worker(cow_device, misc_name, base_path_merge, snapuserd),
       cow_op_merge_size_(cow_op_merge_size) {}
 
+bool MergeWorker::PreserveOverriddenBlocks(const CowOperation* cow_op, void* op_buffer,
+                                           size_t op_size) {
+    if (!cow_op || !op_buffer || op_size == 0) {
+        return false;
+    }
+
+    const uint64_t op_blocks = op_size / BLOCK_SZ;
+    auto* op_bytes = static_cast<uint8_t*>(op_buffer);
+
+    for (uint64_t i = 0; i < op_blocks; i++) {
+        const chunk_t block = cow_op->new_block + i;
+        if (!snapuserd_->IsBlockOverridden(block)) {
+            continue;
+        }
+
+        const off_t base_offset = static_cast<off_t>(block) * BLOCK_SZ;
+        if (!android::base::ReadFullyAtOffset(base_path_merge_fd_, op_bytes + (i * BLOCK_SZ),
+                                              BLOCK_SZ, base_offset)) {
+            SNAP_PLOG(ERROR) << "Failed to read base block while preserving override. block="
+                             << block;
+            return false;
+        }
+    }
+
+    return true;
+}
+
 int MergeWorker::PrepareMerge(uint64_t* source_offset, int* pending_ops,
                               std::vector<const CowOperation*>* replace_zero_vec) {
     int num_ops = *pending_ops;
@@ -120,15 +147,35 @@ bool MergeWorker::MergeReplaceZeroOps() {
     SNAP_LOG(INFO) << "MergeReplaceZeroOps started....";
 
     while (!cowop_iter_->AtEnd()) {
+        if (cowop_iter_->AtEnd()) {
+            break;
+        }
+
+        if (num_ops_merged >= total_ops_merged_per_commit) {
+            if (TEMP_FAILURE_RETRY(fsync(base_path_merge_fd_.get())) < 0) {
+                SNAP_LOG(ERROR) << "Merge: ReplaceZeroOps: Failed to fsync merged data";
+                return false;
+            }
+
+            if (!snapuserd_->CommitMerge(num_ops_merged)) {
+                SNAP_LOG(ERROR) << " Failed to commit the merged block in the header";
+                return false;
+            }
+
+            posix_fadvise(base_path_merge_fd_.get(), 0, 0, POSIX_FADV_DONTNEED);
+            num_ops_merged = 0;
+        }
+
         int num_ops = PAYLOAD_BUFFER_SZ / BLOCK_SZ;
         std::vector<const CowOperation*> replace_zero_vec;
         uint64_t source_offset;
 
         int linear_blocks = PrepareMerge(&source_offset, &num_ops, &replace_zero_vec);
         if (linear_blocks == 0) {
-            // Merge complete
-            CHECK(cowop_iter_->AtEnd());
-            break;
+            if (cowop_iter_->AtEnd()) {
+                break;
+            }
+            continue;
         }
 
         for (size_t i = 0; i < replace_zero_vec.size(); i++) {
@@ -145,6 +192,11 @@ bool MergeWorker::MergeReplaceZeroOps() {
                     SNAP_LOG(ERROR) << "Failed to read COW in merge";
                     return false;
                 }
+
+                if (!PreserveOverriddenBlocks(cow_op, buffer, buffer_size)) {
+                    SNAP_LOG(ERROR) << "Failed to preserve overridden replace blocks";
+                    return false;
+                }
             } else {
                 void* buffer = bufsink_.AcquireBuffer(BLOCK_SZ);
                 if (!buffer) {
@@ -153,6 +205,11 @@ bool MergeWorker::MergeReplaceZeroOps() {
                 }
                 CHECK(cow_op->type() == kCowZeroOp);
                 memset(buffer, 0, BLOCK_SZ);
+
+                if (!PreserveOverriddenBlocks(cow_op, buffer, BLOCK_SZ)) {
+                    SNAP_LOG(ERROR) << "Failed to preserve overridden zero blocks";
+                    return false;
+                }
             }
         }
 
@@ -252,6 +309,20 @@ bool MergeWorker::MergeOrderedOpsAsync() {
 
         SNAP_LOG(DEBUG) << "Merging copy-ops of size: " << num_ops;
         while (num_ops) {
+            while (num_ops && !cowop_iter_->AtEnd()) {
+                const CowOperation* op = cowop_iter_->Get();
+                if (!IsOrderedOp(*op) || !snapuserd_->IsCowOpOverridden(op)) {
+                    break;
+                }
+                cowop_iter_->Next();
+                num_ops -= 1;
+                blocks_merged_in_group_ += 1;
+            }
+
+            if (!num_ops) {
+                break;
+            }
+
             uint64_t source_offset;
 
             int linear_blocks = PrepareMerge(&source_offset, &num_ops);
@@ -437,6 +508,19 @@ bool MergeWorker::MergeOrderedOps() {
         int num_ops = snapuserd_->GetTotalBlocksToMerge();
         SNAP_LOG(DEBUG) << "Merging copy-ops of size: " << num_ops;
         while (num_ops) {
+            while (num_ops && !cowop_iter_->AtEnd()) {
+                const CowOperation* op = cowop_iter_->Get();
+                if (!IsOrderedOp(*op) || !snapuserd_->IsCowOpOverridden(op)) {
+                    break;
+                }
+                cowop_iter_->Next();
+                num_ops -= 1;
+            }
+
+            if (!num_ops) {
+                break;
+            }
+
             uint64_t source_offset;
 
             int linear_blocks = PrepareMerge(&source_offset, &num_ops);
