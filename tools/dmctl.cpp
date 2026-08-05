@@ -142,7 +142,62 @@ class TargetParser final {
             }
             std::string block_device = NextArg();
             return std::make_unique<DmTargetBow>(start_sector, num_sectors, block_device);
+        } else if (target_type == "snapshot-origin") {
+            if (!HasArgs(1)) {
+                std::cerr << "Expected \"snapshot-origin\" <block_device>" << std::endl;
+                return nullptr;
+            }
+            std::string block_device = NextArg();
+            return std::make_unique<DmTargetSnapshotOrigin>(start_sector, num_sectors,
+                                                            block_device);
+        } else if (target_type == "snapshot") {
+            if (!HasArgs(4)) {
+                std::cerr
+                        << "Expected \"snapshot\" <block_device> <block_device> <mode> <chunk_size>"
+                        << std::endl;
+                return nullptr;
+            }
+            std::string base_device = NextArg();
+            std::string cow_device = NextArg();
+            std::string mode_str = NextArg();
+            std::string chunk_size_str = NextArg();
 
+            SnapshotStorageMode mode;
+            if (mode_str == "P") {
+                mode = SnapshotStorageMode::Persistent;
+            } else if (mode_str == "N") {
+                mode = SnapshotStorageMode::Transient;
+            } else {
+                std::cerr << "Unrecognized mode: " << mode_str << "\n";
+                return nullptr;
+            }
+
+            uint32_t chunk_size;
+            if (!android::base::ParseUint(chunk_size_str, &chunk_size)) {
+                std::cerr << "Chunk size must be an unsigned integer.\n";
+                return nullptr;
+            }
+            return std::make_unique<DmTargetSnapshot>(start_sector, num_sectors, base_device,
+                                                      cow_device, mode, chunk_size);
+        } else if (target_type == "snapshot-merge") {
+            if (!HasArgs(3)) {
+                std::cerr
+                        << "Expected \"snapshot-merge\" <block_device> <block_device> <chunk_size>"
+                        << std::endl;
+                return nullptr;
+            }
+            std::string base_device = NextArg();
+            std::string cow_device = NextArg();
+            std::string chunk_size_str = NextArg();
+            SnapshotStorageMode mode = SnapshotStorageMode::Merge;
+
+            uint32_t chunk_size;
+            if (!android::base::ParseUint(chunk_size_str, &chunk_size)) {
+                std::cerr << "Chunk size must be an unsigned integer.\n";
+                return nullptr;
+            }
+            return std::make_unique<DmTargetSnapshot>(start_sector, num_sectors, base_device,
+                                                      cow_device, mode, chunk_size);
         } else if (target_type == "user") {
             if (!HasArgs(1)) {
                 std::cerr << "Expected \"user\" <control_device_name>" << std::endl;

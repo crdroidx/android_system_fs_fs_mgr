@@ -247,5 +247,21 @@ bool IsVirtualAbEnabled();
 
 #define RETURN_IF_NON_VIRTUAL_AB() RETURN_IF_NON_VIRTUAL_AB_MSG("")
 
+#define SKIP_IF_VENDOR_ON_ANDROID_S()                                        \
+    do {                                                                     \
+        if (IsVendorFromAndroid12())                                         \
+            GTEST_SKIP() << "Skip test as Vendor partition is on Android S"; \
+    } while (0)
+
+#define RETURN_IF_VENDOR_ON_ANDROID_S_MSG(msg) \
+    do {                                       \
+        if (IsVendorFromAndroid12()) {         \
+            std::cerr << (msg);                \
+            return;                            \
+        }                                      \
+    } while (0)
+
+#define RETURN_IF_VENDOR_ON_ANDROID_S() RETURN_IF_VENDOR_ON_ANDROID_S_MSG("")
+
 }  // namespace snapshot
 }  // namespace android

@@ -242,7 +242,40 @@ bool GetLegacyCompressionEnabledProperty() {
     return fetcher->GetBoolProperty("ro.virtual_ab.compression.enabled", false);
 }
 
+bool GetUserspaceSnapshotsEnabledProperty() {
+    auto fetcher = IPropertyFetcher::GetInstance();
+    return fetcher->GetBoolProperty("ro.virtual_ab.userspace.snapshots.enabled", false);
+}
+
+bool IsVendorFromAndroid12() {
+    auto fetcher = IPropertyFetcher::GetInstance();
+
+    const std::string UNKNOWN = "unknown";
+    const std::string vendor_release =
+            fetcher->GetProperty("ro.vendor.build.version.release_or_codename", UNKNOWN);
+
+    // No user-space snapshots if vendor partition is on Android 12
+    if (vendor_release.find("12") != std::string::npos) {
+        return true;
+    }
+
+    return false;
+}
+
 bool CanUseUserspaceSnapshots() {
+    if (!GetUserspaceSnapshotsEnabledProperty()) {
+        LOG(INFO) << "Virtual A/B - Userspace snapshots disabled";
+        return false;
+    }
+
+    if (IsDmSnapshotTestingEnabled()) {
+        LOG(INFO) << "Userspace snapshots disabled for testing";
+        return false;
+    }
+    if (!KernelSupportsCompressedSnapshots()) {
+        LOG(ERROR) << "Userspace snapshots requested, but no kernel support is available.";
+        return false;
+    }
     return true;
 }
 
@@ -277,6 +310,16 @@ std::string GetOtherPartitionName(const std::string& name) {
 
     auto other_suffix = (suffix == "_a") ? "_b" : "_a";
     return name.substr(0, name.size() - suffix.size()) + other_suffix;
+}
+
+bool IsDmSnapshotTestingEnabled() {
+    auto fetcher = IPropertyFetcher::GetInstance();
+    return fetcher->GetBoolProperty("snapuserd.test.dm.snapshots", false);
+}
+
+bool KernelSupportsCompressedSnapshots() {
+    auto& dm = DeviceMapper::Instance();
+    return dm.GetTargetByName("user", nullptr);
 }
 
 static bool IsDebuggable() {

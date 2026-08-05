@@ -133,13 +133,18 @@ void AppendExtent(google::protobuf::RepeatedPtrField<chromeos_update_engine::Ext
 // Wrapper around android::base::RemoveFileIfExists that includes logging.
 bool RemoveFileIfExists(const std::string& path);
 
+bool KernelSupportsCompressedSnapshots();
+
 bool GetLegacyCompressionEnabledProperty();
+bool GetUserspaceSnapshotsEnabledProperty();
 bool GetIouringEnabledProperty();
 bool GetXorCompressionEnabledProperty();
 bool GetODirectEnabledProperty();
 bool GetSkipVerificationProperty();
 bool GetUblkEnabledProperty();
 bool CanUseUserspaceSnapshots();
+bool IsDmSnapshotTestingEnabled();
+bool IsVendorFromAndroid12();
 bool GetDebugFlag(const std::string& flag);
 std::optional<int> GetDebugFlagInt(const std::string& flag);
 // Swap the suffix of a partition name.

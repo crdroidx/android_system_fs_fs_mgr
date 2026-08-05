@@ -113,7 +113,8 @@ void SnapuserdTestBase::SetUp() {
 
 bool SnapuserdTestBase::ShouldSkipSetUp() {
 #ifdef __ANDROID__
-    if (!android::snapshot::CanUseUserspaceSnapshots()) {
+    if (!android::snapshot::CanUseUserspaceSnapshots() ||
+        android::snapshot::IsVendorFromAndroid12()) {
         return true;
     }
 #endif

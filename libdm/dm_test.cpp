@@ -20,10 +20,14 @@
 #include <sys/ioctl.h>
 #include <sys/types.h>
 #include <sys/utsname.h>
+#include <time.h>
 #include <unistd.h>
 
 #include <chrono>
 #include <ctime>
+#include <iostream>
+#include <map>
+#include <thread>
 
 #include <android-base/file.h>
 #include <android-base/logging.h>
@@ -42,6 +46,7 @@ using namespace std;
 using namespace std::chrono_literals;
 using namespace android::dm;
 using namespace android::storage_literals;
+using android::base::make_scope_guard;
 using android::base::unique_fd;
 
 class DmTest : public ::testing::Test {
@@ -270,6 +275,330 @@ TEST_F(DmTest, DmVerityArgsTryVerifyTaskletNoImpactOnOlderKernel) {
             "/dev/block/platform/soc/1da4000.ufshc/by-name/vendor_a 4096 4096 125961 125961 sha1 "
             "4be7e823b8c40f7bd5c8ccd5123f0722c5baca21 cc99f81ecb9484220a003b0719ee59dcf9be7e5d";
     EXPECT_EQ(target.GetParameterString(), expected);
+}
+
+TEST_F(DmTest, DmSnapshotArgs) {
+    DmTargetSnapshot target1(0, 512, "base", "cow", SnapshotStorageMode::Persistent, 8);
+    if (DmTargetSnapshot::ReportsOverflow("snapshot")) {
+        EXPECT_EQ(target1.GetParameterString(), "base cow PO 8");
+    } else {
+        EXPECT_EQ(target1.GetParameterString(), "base cow P 8");
+    }
+    EXPECT_EQ(target1.name(), "snapshot");
+
+    DmTargetSnapshot target2(0, 512, "base", "cow", SnapshotStorageMode::Transient, 8);
+    EXPECT_EQ(target2.GetParameterString(), "base cow N 8");
+    EXPECT_EQ(target2.name(), "snapshot");
+
+    DmTargetSnapshot target3(0, 512, "base", "cow", SnapshotStorageMode::Merge, 8);
+    if (DmTargetSnapshot::ReportsOverflow("snapshot-merge")) {
+        EXPECT_EQ(target3.GetParameterString(), "base cow PO 8");
+    } else {
+        EXPECT_EQ(target3.GetParameterString(), "base cow P 8");
+    }
+    EXPECT_EQ(target3.name(), "snapshot-merge");
+}
+
+TEST_F(DmTest, DmSnapshotOriginArgs) {
+    DmTargetSnapshotOrigin target(0, 512, "base");
+    EXPECT_EQ(target.GetParameterString(), "base");
+    EXPECT_EQ(target.name(), "snapshot-origin");
+}
+
+class SnapshotTestHarness final {
+  public:
+    bool Setup();
+    bool Merge();
+
+    std::string origin_dev() const { return origin_dev_->path(); }
+    std::string snapshot_dev() const { return snapshot_dev_->path(); }
+
+    int base_fd() const { return base_fd_; }
+
+    static const uint64_t kBaseDeviceSize = 1024 * 1024;
+    static const uint64_t kCowDeviceSize = 1024 * 64;
+    static const uint64_t kSectorSize = 512;
+
+  private:
+    void SetupImpl();
+    void MergeImpl();
+
+    unique_fd base_fd_;
+    unique_fd cow_fd_;
+    unique_ptr<LoopDevice> base_loop_;
+    unique_ptr<LoopDevice> cow_loop_;
+    unique_ptr<TempDevice> origin_dev_;
+    unique_ptr<TempDevice> snapshot_dev_;
+    bool setup_ok_ = false;
+    bool merge_ok_ = false;
+};
+
+bool SnapshotTestHarness::Setup() {
+    SetupImpl();
+    return setup_ok_;
+}
+
+void SnapshotTestHarness::SetupImpl() {
+    base_fd_ = CreateTempFile("base_device", kBaseDeviceSize);
+    ASSERT_GE(base_fd_, 0);
+    cow_fd_ = CreateTempFile("cow_device", kCowDeviceSize);
+    ASSERT_GE(cow_fd_, 0);
+
+    base_loop_ = std::make_unique<LoopDevice>(base_fd_, 10s);
+    ASSERT_TRUE(base_loop_->valid());
+    cow_loop_ = std::make_unique<LoopDevice>(cow_fd_, 10s);
+    ASSERT_TRUE(cow_loop_->valid());
+
+    DmTable origin_table;
+    ASSERT_TRUE(origin_table.AddTarget(make_unique<DmTargetSnapshotOrigin>(
+            0, kBaseDeviceSize / kSectorSize, base_loop_->device())));
+    ASSERT_TRUE(origin_table.valid());
+    ASSERT_EQ(kBaseDeviceSize / kSectorSize, origin_table.num_sectors());
+
+    origin_dev_ = std::make_unique<TempDevice>("libdm-test-dm-snapshot-origin", origin_table);
+    ASSERT_TRUE(origin_dev_->valid());
+    ASSERT_FALSE(origin_dev_->path().empty());
+
+    // chunk size = 4K blocks.
+    DmTable snap_table;
+    ASSERT_TRUE(snap_table.AddTarget(make_unique<DmTargetSnapshot>(
+            0, kBaseDeviceSize / kSectorSize, base_loop_->device(), cow_loop_->device(),
+            SnapshotStorageMode::Persistent, 8)));
+    ASSERT_TRUE(snap_table.valid());
+    ASSERT_EQ(kBaseDeviceSize / kSectorSize, snap_table.num_sectors());
+
+    snapshot_dev_ = std::make_unique<TempDevice>("libdm-test-dm-snapshot", snap_table);
+    ASSERT_TRUE(snapshot_dev_->valid());
+    ASSERT_FALSE(snapshot_dev_->path().empty());
+
+    setup_ok_ = true;
+}
+
+bool SnapshotTestHarness::Merge() {
+    MergeImpl();
+    return merge_ok_;
+}
+
+void SnapshotTestHarness::MergeImpl() {
+    DmTable merge_table;
+    ASSERT_TRUE(merge_table.AddTarget(
+            make_unique<DmTargetSnapshot>(0, kBaseDeviceSize / kSectorSize, base_loop_->device(),
+                                          cow_loop_->device(), SnapshotStorageMode::Merge, 8)));
+    ASSERT_TRUE(merge_table.valid());
+    ASSERT_EQ(kBaseDeviceSize / kSectorSize, merge_table.num_sectors());
+
+    DeviceMapper& dm = DeviceMapper::Instance();
+    ASSERT_TRUE(dm.LoadTableAndActivate("libdm-test-dm-snapshot", merge_table));
+
+    while (true) {
+        vector<DeviceMapper::TargetInfo> status;
+        ASSERT_TRUE(dm.GetTableStatus("libdm-test-dm-snapshot", &status));
+        ASSERT_EQ(status.size(), 1);
+        ASSERT_EQ(strncmp(status[0].spec.target_type, "snapshot-merge", strlen("snapshot-merge")),
+                  0);
+
+        DmTargetSnapshot::Status merge_status;
+        ASSERT_TRUE(DmTargetSnapshot::ParseStatusText(status[0].data, &merge_status));
+        ASSERT_TRUE(merge_status.error.empty());
+        if (merge_status.sectors_allocated == merge_status.metadata_sectors) {
+            break;
+        }
+
+        std::this_thread::sleep_for(250ms);
+    }
+
+    merge_ok_ = true;
+}
+
+bool CheckSnapshotAvailability() {
+    DmTargetTypeInfo info;
+
+    DeviceMapper& dm = DeviceMapper::Instance();
+    if (!dm.GetTargetByName("snapshot", &info)) {
+        cout << "snapshot module not enabled; skipping test" << std::endl;
+        return false;
+    }
+    if (!dm.GetTargetByName("snapshot-merge", &info)) {
+        cout << "snapshot-merge module not enabled; skipping test" << std::endl;
+        return false;
+    }
+    if (!dm.GetTargetByName("snapshot-origin", &info)) {
+        cout << "snapshot-origin module not enabled; skipping test" << std::endl;
+        return false;
+    }
+    return true;
+}
+
+TEST_F(DmTest, DmSnapshot) {
+    if (!CheckSnapshotAvailability()) {
+        return;
+    }
+
+    SnapshotTestHarness harness;
+    ASSERT_TRUE(harness.Setup());
+
+    // Open the dm devices.
+    unique_fd origin_fd(open(harness.origin_dev().c_str(), O_RDONLY | O_CLOEXEC));
+    ASSERT_GE(origin_fd, 0);
+    unique_fd snapshot_fd(open(harness.snapshot_dev().c_str(), O_RDWR | O_CLOEXEC | O_SYNC));
+    ASSERT_GE(snapshot_fd, 0);
+
+    // Write to the first block of the snapshot device.
+    std::string data("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz");
+    ASSERT_TRUE(android::base::WriteFully(snapshot_fd, data.data(), data.size()));
+    ASSERT_EQ(lseek(snapshot_fd, 0, SEEK_SET), 0);
+
+    // We should get the same data back from the snapshot device.
+    std::string read(data.size(), '\0');
+    ASSERT_TRUE(android::base::ReadFully(snapshot_fd, read.data(), read.size()));
+    ASSERT_EQ(read, data);
+
+    // We should see the original data from the origin device.
+    std::string zeroes(data.size(), '\0');
+    ASSERT_TRUE(android::base::ReadFully(origin_fd, read.data(), read.size()));
+    ASSERT_EQ(lseek(snapshot_fd, 0, SEEK_SET), 0);
+    ASSERT_EQ(read, zeroes);
+
+    // We should also see the original data from the base device.
+    ASSERT_TRUE(android::base::ReadFully(harness.base_fd(), read.data(), read.size()));
+    ASSERT_EQ(lseek(harness.base_fd(), 0, SEEK_SET), 0);
+    ASSERT_EQ(read, zeroes);
+
+    // Now, perform the merge and wait.
+    ASSERT_TRUE(harness.Merge());
+
+    // Reading from the base device should give us the modified data.
+    ASSERT_TRUE(android::base::ReadFully(harness.base_fd(), read.data(), read.size()));
+    ASSERT_EQ(lseek(harness.base_fd(), 0, SEEK_SET), 0);
+    ASSERT_EQ(read, data);
+}
+
+TEST_F(DmTest, DmSnapshotOverflow) {
+    if (!CheckSnapshotAvailability()) {
+        return;
+    }
+
+    SnapshotTestHarness harness;
+    ASSERT_TRUE(harness.Setup());
+
+    // Open the dm devices.
+    unique_fd snapshot_fd(open(harness.snapshot_dev().c_str(), O_RDWR | O_CLOEXEC));
+    ASSERT_GE(snapshot_fd, 0);
+
+    // Fill the copy-on-write device until it overflows.
+    uint64_t bytes_remaining = SnapshotTestHarness::kCowDeviceSize;
+    uint8_t byte = 1;
+    while (bytes_remaining) {
+        std::string data(4096, char(byte));
+        if (!android::base::WriteFully(snapshot_fd, data.data(), data.size())) {
+            ASSERT_EQ(errno, EIO);
+            break;
+        }
+        bytes_remaining -= data.size();
+    }
+
+    // If writes succeed (because they are buffered), then we should expect an
+    // fsync to fail with EIO.
+    if (!bytes_remaining) {
+        ASSERT_EQ(fsync(snapshot_fd), -1);
+        ASSERT_EQ(errno, EIO);
+    }
+
+    DeviceMapper& dm = DeviceMapper::Instance();
+
+    vector<DeviceMapper::TargetInfo> target_status;
+    ASSERT_TRUE(dm.GetTableStatus("libdm-test-dm-snapshot", &target_status));
+    ASSERT_EQ(target_status.size(), 1);
+    ASSERT_EQ(strncmp(target_status[0].spec.target_type, "snapshot", strlen("snapshot")), 0);
+
+    DmTargetSnapshot::Status status;
+    ASSERT_TRUE(DmTargetSnapshot::ParseStatusText(target_status[0].data, &status));
+    if (DmTargetSnapshot::ReportsOverflow("snapshot")) {
+        ASSERT_EQ(status.error, "Overflow");
+    } else {
+        ASSERT_EQ(status.error, "Invalid");
+    }
+}
+
+TEST_F(DmTest, ParseStatusText) {
+    DmTargetSnapshot::Status status;
+
+    // Bad inputs
+    EXPECT_FALSE(DmTargetSnapshot::ParseStatusText("", &status));
+    EXPECT_FALSE(DmTargetSnapshot::ParseStatusText("X", &status));
+    EXPECT_FALSE(DmTargetSnapshot::ParseStatusText("123", &status));
+    EXPECT_FALSE(DmTargetSnapshot::ParseStatusText("123/456", &status));
+    EXPECT_FALSE(DmTargetSnapshot::ParseStatusText("123 456", &status));
+    EXPECT_FALSE(DmTargetSnapshot::ParseStatusText("123 456", &status));
+    EXPECT_FALSE(DmTargetSnapshot::ParseStatusText("123 456 789", &status));
+    EXPECT_FALSE(DmTargetSnapshot::ParseStatusText("123 456/789", &status));
+    EXPECT_FALSE(DmTargetSnapshot::ParseStatusText("123/456/789", &status));
+    EXPECT_FALSE(DmTargetSnapshot::ParseStatusText("123 / 456 789", &status));
+
+    // Good input
+    EXPECT_TRUE(DmTargetSnapshot::ParseStatusText("123/456 789", &status));
+    EXPECT_EQ(status.sectors_allocated, 123);
+    EXPECT_EQ(status.total_sectors, 456);
+    EXPECT_EQ(status.metadata_sectors, 789);
+
+    // Known error codes
+    EXPECT_TRUE(DmTargetSnapshot::ParseStatusText("Invalid", &status));
+    EXPECT_TRUE(DmTargetSnapshot::ParseStatusText("Merge failed", &status));
+    EXPECT_TRUE(DmTargetSnapshot::ParseStatusText("Overflow", &status));
+}
+
+TEST_F(DmTest, DmSnapshotMergePercent) {
+    DmTargetSnapshot::Status status;
+
+    // Correct input
+    status.sectors_allocated = 1000;
+    status.total_sectors = 1000;
+    status.metadata_sectors = 0;
+    EXPECT_LE(DmTargetSnapshot::MergePercent(status), 1.0);
+
+    status.sectors_allocated = 500;
+    status.total_sectors = 1000;
+    status.metadata_sectors = 0;
+    EXPECT_GE(DmTargetSnapshot::MergePercent(status), 49.0);
+    EXPECT_LE(DmTargetSnapshot::MergePercent(status), 51.0);
+
+    status.sectors_allocated = 0;
+    status.total_sectors = 1000;
+    status.metadata_sectors = 0;
+    EXPECT_GE(DmTargetSnapshot::MergePercent(status), 99.0);
+
+    status.sectors_allocated = 500;
+    status.total_sectors = 1000;
+    status.metadata_sectors = 500;
+    EXPECT_GE(DmTargetSnapshot::MergePercent(status), 99.0);
+
+    status.sectors_allocated = 500;
+    status.total_sectors = 1000;
+    status.metadata_sectors = 0;
+    EXPECT_LE(DmTargetSnapshot::MergePercent(status, 500), 1.0);
+    EXPECT_LE(DmTargetSnapshot::MergePercent(status, 1000), 51.0);
+    EXPECT_GE(DmTargetSnapshot::MergePercent(status, 1000), 49.0);
+
+    // Robustness
+    status.sectors_allocated = 2000;
+    status.total_sectors = 1000;
+    status.metadata_sectors = 0;
+    EXPECT_LE(DmTargetSnapshot::MergePercent(status), 0.0);
+
+    status.sectors_allocated = 2000;
+    status.total_sectors = 1000;
+    status.metadata_sectors = 2000;
+    EXPECT_LE(DmTargetSnapshot::MergePercent(status), 0.0);
+
+    status.sectors_allocated = 2000;
+    status.total_sectors = 0;
+    status.metadata_sectors = 2000;
+    EXPECT_LE(DmTargetSnapshot::MergePercent(status), 0.0);
+
+    status.sectors_allocated = 1000;
+    status.total_sectors = 0;
+    status.metadata_sectors = 1000;
+    EXPECT_LE(DmTargetSnapshot::MergePercent(status, 0), 0.0);
 }
 
 TEST_F(DmTest, CryptArgs) {

@@ -23,6 +23,9 @@
       "name": "vts_libsnapshot_test"
     },
     {
+      "name": "vab_legacy_tests"
+    },
+    {
       "name": "cow_api_test"
     }
   ],
@@ -37,6 +40,9 @@
     },
     {
       "name": "liblp_test"
+    },
+    {
+      "name": "vab_legacy_tests"
     },
     {
       "name": "snapuserd_test"

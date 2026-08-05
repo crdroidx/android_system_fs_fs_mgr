@@ -203,9 +203,6 @@ AssertionResult FillFakeMetadata(MetadataBuilder* builder, const DeltaArchiveMan
 
 void SetSize(PartitionUpdate* partition_update, uint64_t size) {
     partition_update->mutable_new_partition_info()->set_size(size);
-    if (!partition_update->has_estimate_cow_size()) {
-        partition_update->set_estimate_cow_size(size);
-    }
 }
 
 uint64_t GetSize(PartitionUpdate* partition_update) {

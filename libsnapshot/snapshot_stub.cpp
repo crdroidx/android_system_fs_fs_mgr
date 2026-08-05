@@ -119,6 +119,11 @@ bool SnapshotManagerStub::UpdateUsesSnapuserd() {
     return false;
 }
 
+bool SnapshotManagerStub::UpdateUsesUserSnapshots() {
+    LOG(ERROR) << __FUNCTION__ << " should never be called.";
+    return false;
+}
+
 std::unique_ptr<ICowWriter> SnapshotManagerStub::OpenSnapshotWriter(
         const CreateLogicalPartitionParams&, std::optional<uint64_t>) {
     LOG(ERROR) << __FUNCTION__ << " should never be called.";

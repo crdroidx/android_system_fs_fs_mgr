@@ -219,7 +219,8 @@ message SnapshotUpdateStatus {
     // io_uring support
     bool io_uring_enabled = 10;
 
-    reserved 11;
+    // legacy dm-snapshot based snapuserd
+    bool legacy_snapuserd = 11;
 
     // Enable direct reads from source device
     bool o_direct = 12;
